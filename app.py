@@ -182,14 +182,35 @@ def get_iam_token(api_key: str) -> Optional[str]:
     try:
         resp = httpx.post(
             IAM_URL,
-            data={"grant_type": "urn:ibm:params:oauth:grant-type:apikey", "apikey": api_key},
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=20,
+            data={
+                "grant_type": "urn:ibm:params:oauth:grant-type:apikey",
+                "apikey": api_key.strip(),
+                "response_type": "cloud_iam",
+            },
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            timeout=30,
         )
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            try:
+                err_body = resp.json()
+                err_msg  = err_body.get("errorMessage") or err_body.get("errorDetails") or resp.text[:300]
+            except Exception:
+                err_msg = resp.text[:300]
+            st.error(
+                f"**IBM IAM Error {resp.status_code}:** {err_msg}\n\n"
+                "**Fix:** Check that `IBM_WATSONX_API_KEY` in your `.env` file is a valid IBM Cloud API key "
+                "(generate one at https://cloud.ibm.com/iam/apikeys)."
+            )
+            return None
         return resp.json()["access_token"]
+    except httpx.TimeoutException:
+        st.error("**IBM IAM Timeout:** Could not reach `iam.cloud.ibm.com` within 30s. Check your internet connection.")
+        return None
     except Exception as e:
-        st.warning(f"IBM IAM token error: {e}")
+        st.error(f"**IBM IAM token error:** {e}")
         return None
 
 
@@ -220,7 +241,20 @@ def granite_generate(prompt: str, max_tokens: int = 800) -> str:
             timeout=60,
         )
         resp.raise_for_status()
-        return resp.json()["results"][0]["generated_text"].strip()
+        data = resp.json()
+
+        # ── Track token usage ──────────────────────────────────────────────────
+        result        = data["results"][0]
+        # WatsonX returns per-call token counts inside each result entry
+        input_tok     = result.get("input_token_count", 0)
+        generated_tok = result.get("generated_token_count", 0)
+        if "token_usage" not in st.session_state:
+            st.session_state.token_usage = {"input": 0, "output": 0, "calls": 0}
+        st.session_state.token_usage["input"]  += input_tok
+        st.session_state.token_usage["output"] += generated_tok
+        st.session_state.token_usage["calls"]  += 1
+
+        return result["generated_text"].strip()
     except Exception as e:
         return f"[Granite Error] {e}"
 
@@ -389,6 +423,21 @@ with st.sidebar:
     st.markdown("• IBM IAM Authentication")
     st.markdown("• IBM Cloud Lite (free tier)")
     st.markdown("---")
+    # ── Token Usage Widget ─────────────────────────────────────────────────────
+    st.markdown("**🔢 Token Usage (this session)**")
+    tu = st.session_state.get("token_usage", {"input": 0, "output": 0, "calls": 0})
+    total_tok = tu["input"] + tu["output"]
+    st.metric("API Calls", tu["calls"])
+    col_t1, col_t2 = st.columns(2)
+    col_t1.metric("Input", f"{tu['input']:,}")
+    col_t2.metric("Output", f"{tu['output']:,}")
+    st.metric("Total Tokens", f"{total_tok:,}")
+    if tu["calls"] > 0:
+        st.progress(min(total_tok / 10000, 1.0), text=f"{total_tok:,} / 10,000 est.")
+    if st.button("Reset Counter", key="reset_token_usage"):
+        st.session_state.token_usage = {"input": 0, "output": 0, "calls": 0}
+        st.rerun()
+    st.markdown("---")
     st.caption("AICTE AI Grant Finder v1.0")
 
 # ── Session state init ─────────────────────────────────────────────────────────
@@ -396,6 +445,8 @@ if "profiles" not in st.session_state:
     st.session_state.profiles = []
 if "proposals" not in st.session_state:
     st.session_state.proposals = []
+if "token_usage" not in st.session_state:
+    st.session_state.token_usage = {"input": 0, "output": 0, "calls": 0}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE: DASHBOARD
@@ -723,14 +774,63 @@ uvicorn app.main:app --reload --port 8000
 """)
 
     st.markdown("### ⚙️ IBM Configuration")
+    api_key_ok = bool(IBM_WATSONX_API_KEY and IBM_WATSONX_API_KEY != "your_ibm_watsonx_api_key_here")
+    proj_id_ok = bool(IBM_WATSONX_PROJECT_ID and IBM_WATSONX_PROJECT_ID != "your_ibm_watsonx_project_id_here")
     st.code(f"""
-IBM_WATSONX_API_KEY    = {"✅ SET" if IBM_WATSONX_API_KEY and IBM_WATSONX_API_KEY != "your_ibm_watsonx_api_key_here" else "❌ NOT SET"}
-IBM_WATSONX_PROJECT_ID = {"✅ SET" if IBM_WATSONX_PROJECT_ID and IBM_WATSONX_PROJECT_ID != "your_ibm_watsonx_project_id_here" else "❌ NOT SET"}
+IBM_WATSONX_API_KEY    = {"✅ SET" if api_key_ok else "❌ NOT SET"}
+IBM_WATSONX_PROJECT_ID = {"✅ SET" if proj_id_ok else "❌ NOT SET"}
 IBM_GRANITE_MODEL_ID   = {IBM_GRANITE_MODEL_ID}
 IBM_WATSONX_URL        = {IBM_WATSONX_URL}
+IAM_URL                = {IAM_URL}
 """, language="ini")
 
-    if not (IBM_WATSONX_API_KEY and IBM_WATSONX_API_KEY != "your_ibm_watsonx_api_key_here"):
+    # ── Live connection test ───────────────────────────────────────────────────
+    st.markdown("### 🔬 Test IBM IAM Connection")
+    if not api_key_ok:
+        st.warning("⚠️ `IBM_WATSONX_API_KEY` is not set in `.env`. Set it first, then restart the app.")
+    else:
+        if st.button("▶ Test IBM IAM Token Now", type="primary"):
+            with st.spinner("Contacting IBM IAM…"):
+                try:
+                    test_resp = httpx.post(
+                        IAM_URL,
+                        data={
+                            "grant_type": "urn:ibm:params:oauth:grant-type:apikey",
+                            "apikey": IBM_WATSONX_API_KEY.strip(),
+                            "response_type": "cloud_iam",
+                        },
+                        headers={
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "Accept": "application/json",
+                        },
+                        timeout=30,
+                    )
+                    if test_resp.status_code == 200:
+                        tok = test_resp.json().get("access_token", "")
+                        exp = test_resp.json().get("expiration", "")
+                        st.success(
+                            f"✅ **IBM IAM token obtained successfully!**\n\n"
+                            f"Token preview: `{tok[:20]}…`  |  Expires: `{exp}`"
+                        )
+                    else:
+                        try:
+                            err = test_resp.json()
+                            msg = err.get("errorMessage") or err.get("errorDetails") or test_resp.text[:400]
+                        except Exception:
+                            msg = test_resp.text[:400]
+                        st.error(
+                            f"❌ **HTTP {test_resp.status_code}** — {msg}\n\n"
+                            "**Common causes:**\n"
+                            "- API key is incorrect or expired → regenerate at https://cloud.ibm.com/iam/apikeys\n"
+                            "- API key was deleted or restricted\n"
+                            "- Extra whitespace/quotes around the key in `.env`"
+                        )
+                except httpx.TimeoutException:
+                    st.error("❌ **Timeout** — `iam.cloud.ibm.com` did not respond in 30s. Check internet/firewall.")
+                except Exception as ex:
+                    st.error(f"❌ **Unexpected error:** {ex}")
+
+    if not api_key_ok:
         st.info("""
 **Get your IBM API keys (free):**
 1. Sign up at [cloud.ibm.com](https://cloud.ibm.com) (Lite tier is free)

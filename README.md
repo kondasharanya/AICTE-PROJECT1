@@ -162,10 +162,9 @@ docker-compose up --build
 3. **Generate an API Key** → IBM Cloud → Manage → Access (IAM) → API Keys → Create
 4. **Copy your Project ID** → watsonx.ai → Your Project → Manage → General → Project ID
 5. **Update your `.env`:**
-
 ```env
-IBM_WATSONX_API_KEY=your_api_key_here
-IBM_WATSONX_PROJECT_ID=your_project_id_here
+IBM_WATSONX_API_KEY=V0Dah_5C-dqhKKVxAGpsltlMbQECEb03LNsmkf43cLCj
+IBM_WATSONX_PROJECT_ID=0a96dd2c-b98c-4606-9fef-ad823a60574f
 IBM_GRANITE_MODEL_ID=ibm/granite-13b-chat-v2
 IBM_WATSONX_URL=https://us-south.ml.cloud.ibm.com
 ```
